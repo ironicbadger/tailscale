@@ -99,6 +99,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -111,6 +112,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -149,6 +151,62 @@ func run() error {
 	cfg, err := configFromEnv()
 	if err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
+	}
+
+	// Add support for TS_SERVE_PORT to dynamically generate a default ServeConfig
+	if tsServePort := os.Getenv("TS_SERVE_PORT"); tsServePort != "" {
+		// Validate that the port is a valid integer in the range 1-65535
+		port, err := strconv.Atoi(tsServePort)
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("invalid TS_SERVE_PORT value %q: must be an integer between 1-65535", tsServePort)
+		}
+
+		if cfg.ServeConfigPath == "" {
+			// Create a default ServeConfig structure using the appropriate structs
+			defaultServeConfig := &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					443: {HTTPS: true},
+				},
+				Web: map[ipn.HostPort]*ipn.WebServerConfig{
+					"${TS_CERT_DOMAIN}:443": {
+						Handlers: map[string]*ipn.HTTPHandler{
+							"/": {
+								Proxy: fmt.Sprintf("http://127.0.0.1:%d", port),
+							},
+						},
+					},
+				},
+			}
+
+			// Convert the struct to JSON
+			configJSON, err := json.MarshalIndent(defaultServeConfig, "", "  ")
+			if err != nil {
+				return fmt.Errorf("failed to marshal default serve config: %w", err)
+			}
+
+			// Check for custom path first before setting default
+			if customPath := os.Getenv("TS_SERVE_CONFIG_PATH"); customPath != "" {
+				cfg.ServeConfigPath = customPath
+				dir := filepath.Dir(customPath)
+				if err := os.MkdirAll(dir, 0755); err != nil {
+					return fmt.Errorf("failed to create directory for serve config: %w", err)
+				}
+			} else {
+				// Use a location that's guaranteed to exist (/tmp) if no custom path
+				cfg.ServeConfigPath = "/tmp/default_serve_config.json"
+			}
+
+			if _, err := os.Stat(cfg.ServeConfigPath); errors.Is(err, os.ErrNotExist) {
+				if err := os.WriteFile(cfg.ServeConfigPath, configJSON, 0644); err != nil {
+					return fmt.Errorf("failed to write default serve config: %w", err)
+				}
+				log.Printf("Generated default serve config at %s using port %d", cfg.ServeConfigPath, port)
+			} else {
+				log.Printf("Serve config file already exists at %s, skipping write", cfg.ServeConfigPath)
+			}
+		} else {
+			log.Printf("ServeConfigPath is already set to %q, ignoring TS_SERVE_PORT", cfg.ServeConfigPath)
+		}
 	}
 
 	if !cfg.UserspaceMode {
